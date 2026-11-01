@@ -1,4 +1,4 @@
-# `odin/tigris` — Tigris S3 Object Storage & SHA-256 Asset Manifest Library for Odin
+# `odin-tigris` (`tigris`) — Tigris S3 Object Storage & SHA-256 Asset Manifest Library for Odin
 
 Standalone Odin (`dev-2026-09`) library for syncing static assets, computing/diffing SHA-256 manifests (`manifest.sha256`), and interacting with [Tigris](https://www.tigrisdata.com/) S3 object storage (`t3://`) via the `t3` / `tigris` CLI.
 

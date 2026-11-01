@@ -62,6 +62,7 @@ Asset_Report :: struct {
 	deleted_count:    int           `json:"deleted_count"`,
 	diff:             Manifest_Diff `json:"diff,omitempty"`,
 	objects:          []string      `json:"objects,omitempty"`,
+	telemetry_db:     string        `json:"telemetry_db,omitempty"`,
 	message:          string        `json:"message,omitempty"`,
 }
 
