@@ -12,11 +12,19 @@ package tigris
 
 import "core:crypto/hash"
 import "core:encoding/hex"
+import "core:encoding/json"
 import "core:fmt"
 import "core:os"
 import "core:path/filepath"
 import "core:slice"
 import "core:strings"
+
+S3_Credentials :: struct {
+	access_key: string,
+	secret_key: string,
+	endpoint:   string,
+	ok:         bool,
+}
 
 Config :: struct {
 	bucket:    string   `json:"bucket"`,
@@ -269,6 +277,86 @@ diff_manifests :: proc(
 	}
 }
 
+// Resolve Tigris S3 credentials (`access_key`, `secret_key`, `endpoint`) from process env,
+// `.env.local` / `.env` in `root_dir`, or `~/.tigris/config.json`.
+resolve_s3_credentials :: proc(root_dir := ".", allocator := context.temp_allocator) -> S3_Credentials {
+	ak := os.get_env("TIGRIS_STORAGE_ACCESS_KEY_ID", allocator)
+	if len(ak) == 0 do ak = os.get_env("AWS_ACCESS_KEY_ID", allocator)
+
+	sk := os.get_env("TIGRIS_STORAGE_SECRET_ACCESS_KEY", allocator)
+	if len(sk) == 0 do sk = os.get_env("AWS_SECRET_ACCESS_KEY", allocator)
+
+	ep := os.get_env("TIGRIS_STORAGE_ENDPOINT", allocator)
+	if len(ep) == 0 do ep = os.get_env("AWS_ENDPOINT_URL_S3", allocator)
+
+	if len(ak) == 0 || len(sk) == 0 {
+		env_files := []string{".env.local", ".env"}
+		for ef in env_files {
+			ef_path, _ := filepath.join({root_dir, ef}, allocator)
+			data, rerr := os.read_entire_file(ef_path, allocator)
+			if rerr != nil do continue
+
+			for raw_line in strings.split_lines(string(data), allocator) {
+				line := strings.trim_space(raw_line)
+				if len(line) == 0 || strings.has_prefix(line, "#") do continue
+				eq_idx := strings.index_byte(line, '=')
+				if eq_idx <= 0 do continue
+				k := strings.trim_space(line[:eq_idx])
+				v := strings.trim(strings.trim_space(line[eq_idx + 1:]), "\"'")
+				if len(v) == 0 do continue
+
+				if (k == "TIGRIS_STORAGE_ACCESS_KEY_ID" || k == "AWS_ACCESS_KEY_ID") && len(ak) == 0 {
+					ak = strings.clone(v, allocator)
+				} else if (k == "TIGRIS_STORAGE_SECRET_ACCESS_KEY" || k == "AWS_SECRET_ACCESS_KEY") && len(sk) == 0 {
+					sk = strings.clone(v, allocator)
+				} else if (k == "TIGRIS_STORAGE_ENDPOINT" || k == "AWS_ENDPOINT_URL_S3") && len(ep) == 0 {
+					ep = strings.clone(v, allocator)
+				}
+			}
+		}
+	}
+
+	if len(ak) == 0 || len(sk) == 0 {
+		home := os.get_env("HOME", allocator)
+		if len(home) > 0 {
+			cfg_path, _ := filepath.join({home, ".tigris", "config.json"}, allocator)
+			if data, rerr := os.read_entire_file(cfg_path, allocator); rerr == nil {
+				Tigris_Cli_Cfg :: struct {
+					credentials: struct {
+						accessKeyId:     string `json:"accessKeyId"`,
+						secretAccessKey: string `json:"secretAccessKey"`,
+						endpoint:        string `json:"endpoint"`,
+					} `json:"credentials"`,
+				}
+				parsed: Tigris_Cli_Cfg
+				if json.unmarshal(data, &parsed, .JSON, allocator) == nil {
+					if len(ak) == 0 && len(parsed.credentials.accessKeyId) > 0 {
+						ak = strings.clone(parsed.credentials.accessKeyId, allocator)
+					}
+					if len(sk) == 0 && len(parsed.credentials.secretAccessKey) > 0 {
+						sk = strings.clone(parsed.credentials.secretAccessKey, allocator)
+					}
+					if len(ep) == 0 && len(parsed.credentials.endpoint) > 0 {
+						ep = strings.clone(parsed.credentials.endpoint, allocator)
+					}
+				}
+			}
+		}
+	}
+
+	if len(ep) == 0 {
+		ep = "https://t3.storage.dev"
+	}
+	ep = strings.trim_right(ep, "/")
+
+	return S3_Credentials{
+		access_key = ak,
+		secret_key = sk,
+		endpoint   = ep,
+		ok         = len(ak) > 0 && len(sk) > 0,
+	}
+}
+
 // Execute a `t3` (or `tigris`) CLI subcommand.
 exec_t3 :: proc(args: []string, work_dir := ".", allocator := context.temp_allocator) -> (stdout_str: string, stderr_str: string, ok: bool) {
 	cmd := make([dynamic]string, 0, len(args) + 1, context.temp_allocator)
@@ -303,28 +391,55 @@ exec_t3 :: proc(args: []string, work_dir := ".", allocator := context.temp_alloc
 	return out_s, err_s, state.success && state.exit_code == 0
 }
 
-// Fetch and parse `t3://<bucket>/<prefix>/manifest.sha256`.
-fetch_remote_manifest :: proc(bucket: string, prefix: string, allocator := context.temp_allocator) -> (entries: []Manifest_Entry, ok: bool) {
-	tmp_file, terr := os.create_temp_file("", "tigris_remote_manifest_*.sha256")
-	if terr != nil {
-		return nil, false
-	}
-	tmp_path := strings.clone(os.name(tmp_file), context.temp_allocator)
-	_ = os.close(tmp_file)
-	defer _ = os.remove(tmp_path)
-
+// Fetch and parse `t3://<bucket>/<prefix>/manifest.sha256` via native `curl --aws-sigv4` or `t3` CLI,
+// falling back to `<local_dir>/manifest.sha256` when running offline / without S3 credentials.
+fetch_remote_manifest :: proc(bucket: string, prefix: string, root_dir := ".", local_dir := "", allocator := context.temp_allocator) -> (entries: []Manifest_Entry, ok: bool) {
 	key := len(prefix) > 0 ? fmt.tprintf("%s/manifest.sha256", strings.trim(prefix, "/")) : "manifest.sha256"
-	_, _, get_ok := exec_t3({"objects", "get", bucket, key, "--output", tmp_path}, ".", context.temp_allocator)
-	if !get_ok {
-		return nil, false
+
+	creds := resolve_s3_credentials(root_dir, context.temp_allocator)
+	if creds.ok {
+		url := fmt.tprintf("%s/%s/%s", creds.endpoint, bucket, key)
+		user_arg := fmt.tprintf("%s:%s", creds.access_key, creds.secret_key)
+		st, stdout, _, err := os.process_exec(
+			{command = {"curl", "-fsSL", "--aws-sigv4", "aws:amz:auto:s3", "--user", user_arg, url}},
+			context.temp_allocator,
+		)
+		if err == nil && st.success && len(stdout) > 0 {
+			parsed := parse_manifest(string(stdout), allocator)
+			if len(parsed) > 0 {
+				return parsed, true
+			}
+		}
 	}
 
-	data, rerr := os.read_entire_file(tmp_path, context.temp_allocator)
-	if rerr != nil || len(data) == 0 {
-		return nil, false
+	tmp_file, terr := os.create_temp_file("", "tigris_remote_manifest_*.sha256")
+	if terr == nil {
+		tmp_path := strings.clone(os.name(tmp_file), context.temp_allocator)
+		_ = os.close(tmp_file)
+		defer _ = os.remove(tmp_path)
+
+		_, _, get_ok := exec_t3({"objects", "get", bucket, key, "--output", tmp_path}, root_dir, context.temp_allocator)
+		if get_ok {
+			if data, rerr := os.read_entire_file(tmp_path, context.temp_allocator); rerr == nil && len(data) > 0 {
+				parsed := parse_manifest(string(data), allocator)
+				if len(parsed) > 0 {
+					return parsed, true
+				}
+			}
+		}
 	}
 
-	return parse_manifest(string(data), allocator), true
+	if len(local_dir) > 0 {
+		local_mf_path, _ := filepath.join({local_dir, "manifest.sha256"}, context.temp_allocator)
+		if data, rerr := os.read_entire_file(local_mf_path, context.temp_allocator); rerr == nil && len(data) > 0 {
+			parsed := parse_manifest(string(data), allocator)
+			if len(parsed) > 0 {
+				return parsed, true
+			}
+		}
+	}
+
+	return nil, false
 }
 
 // Run a Tigris asset command (`status`, `sync`, `pull`, `push`, `ls`).
@@ -359,6 +474,15 @@ run_assets :: proc(
 		pref_arg := fmt.tprintf("%s/", prefix)
 		stdout, stderr, ls_ok := exec_t3({"objects", "list", bucket, "--prefix", pref_arg}, root_dir, allocator)
 		if !ls_ok {
+			remote_mf, rem_ok := fetch_remote_manifest(bucket, prefix, root_dir, local_dir, allocator)
+			if rem_ok {
+				objs := make([dynamic]string, 0, len(remote_mf), allocator)
+				for e in remote_mf {
+					append(&objs, fmt.aprintf("%s/%s", prefix, e.rel_path, allocator = allocator))
+				}
+				report.objects = objs[:]
+				return report, true
+			}
 			report.status  = "failed"
 			report.message = len(stderr) > 0 ? stderr : "Failed to list objects via t3 CLI"
 			return report, false
@@ -375,7 +499,7 @@ run_assets :: proc(
 
 	case "status":
 		local_mf := build_local_manifest(local_dir, opts.subdirs, allocator)
-		remote_mf, rem_ok := fetch_remote_manifest(bucket, prefix, allocator)
+		remote_mf, rem_ok := fetch_remote_manifest(bucket, prefix, root_dir, local_dir, allocator)
 		if !rem_ok {
 			report.status  = "failed"
 			report.message = fmt.aprintf("No remote manifest found at t3://%s/%s/manifest.sha256", bucket, prefix, allocator = allocator)
@@ -390,7 +514,7 @@ run_assets :: proc(
 	case "sync", "pull":
 		_ = make_directory_all(local_dir)
 		local_mf := build_local_manifest(local_dir, opts.subdirs, allocator)
-		remote_mf, rem_ok := fetch_remote_manifest(bucket, prefix, allocator)
+		remote_mf, rem_ok := fetch_remote_manifest(bucket, prefix, root_dir, local_dir, allocator)
 
 		if !opts.force && rem_ok {
 			diff := diff_manifests(local_mf, remote_mf, allocator)
@@ -401,20 +525,65 @@ run_assets :: proc(
 			for m in diff.modified        do append(&to_dl, m)
 			for m in diff.missing_locally do append(&to_dl, m)
 
-			for rel in to_dl {
-				if !opts.dry_run {
-					dst_file, _ := filepath.join({local_dir, rel}, context.temp_allocator)
-					_ = make_directory_all(filepath.dir(dst_file))
-					r_key := fmt.tprintf("%s/%s", prefix, rel)
-					_, stderr, dl_ok := exec_t3({"objects", "get", bucket, r_key, "--output", dst_file}, root_dir, allocator)
-					if !dl_ok {
-						report.status  = "failed"
-						report.message = fmt.aprintf("Failed to download %s: %s", r_key, stderr, allocator = allocator)
-						return report, false
+			if len(to_dl) > 0 && !opts.dry_run {
+				creds := resolve_s3_credentials(root_dir, context.temp_allocator)
+				batch_ok := false
+
+				// Fast path 1: Parallel HTTP/2 S3 download via `curl --parallel --aws-sigv4`
+				if creds.ok {
+					user_arg := fmt.tprintf("%s:%s", creds.access_key, creds.secret_key)
+					curl_cmd := make([dynamic]string, 0, 8 + len(to_dl) * 3, context.temp_allocator)
+					append(&curl_cmd, "curl", "-fsSL", "--parallel", "--parallel-max", "16", "--aws-sigv4", "aws:amz:auto:s3", "--user", user_arg)
+					for rel in to_dl {
+						dst_file, _ := filepath.join({local_dir, rel}, context.temp_allocator)
+						_ = make_directory_all(filepath.dir(dst_file))
+						url := fmt.tprintf("%s/%s/%s/%s", creds.endpoint, bucket, prefix, rel)
+						append(&curl_cmd, "-o", dst_file, url)
+					}
+					st, _, _, err := os.process_exec({command = curl_cmd[:]}, context.temp_allocator)
+					batch_ok = err == nil && st.success
+				}
+
+				// Fast path 2: Parallel CDN download verified against `manifest.sha256` when S3 credentials are absent
+				if !batch_ok && !creds.ok {
+					cdn_base := os.get_env("NVESTIV_ASSETS_CDN_URL", context.temp_allocator)
+					if len(cdn_base) == 0 {
+						cdn_base = "https://nvestiv-website.b-cdn.net"
+					}
+					cdn_base = strings.trim_right(cdn_base, "/")
+
+					curl_cmd := make([dynamic]string, 0, 6 + len(to_dl) * 3, context.temp_allocator)
+					append(&curl_cmd, "curl", "-fsSL", "--parallel", "--parallel-max", "16")
+					for rel in to_dl {
+						dst_file, _ := filepath.join({local_dir, rel}, context.temp_allocator)
+						_ = make_directory_all(filepath.dir(dst_file))
+						url := fmt.tprintf("%s/%s/%s", cdn_base, prefix, rel)
+						append(&curl_cmd, "-o", dst_file, url)
+					}
+					st, _, _, err := os.process_exec({command = curl_cmd[:]}, context.temp_allocator)
+					if err == nil && st.success {
+						post_mf := build_local_manifest(local_dir, opts.subdirs, context.temp_allocator)
+						post_diff := diff_manifests(post_mf, remote_mf, context.temp_allocator)
+						batch_ok = len(post_diff.missing_locally) == 0 && len(post_diff.modified) == 0
 					}
 				}
-				report.downloaded_count += 1
+
+				// Fallback: Sequential `t3 objects get`
+				if !batch_ok {
+					for rel in to_dl {
+						dst_file, _ := filepath.join({local_dir, rel}, context.temp_allocator)
+						_ = make_directory_all(filepath.dir(dst_file))
+						r_key := fmt.tprintf("%s/%s", prefix, rel)
+						_, stderr, dl_ok := exec_t3({"objects", "get", bucket, r_key, "--output", dst_file}, root_dir, allocator)
+						if !dl_ok {
+							report.status  = "failed"
+							report.message = fmt.aprintf("Failed to download %s: %s", r_key, stderr, allocator = allocator)
+							return report, false
+						}
+					}
+				}
 			}
+			report.downloaded_count = len(to_dl)
 
 			if opts.delete_stale {
 				for rel in diff.untracked_remote {
@@ -446,7 +615,7 @@ run_assets :: proc(
 
 	case "push":
 		local_mf := build_local_manifest(local_dir, opts.subdirs, allocator)
-		remote_mf, rem_ok := fetch_remote_manifest(bucket, prefix, allocator)
+		remote_mf, rem_ok := fetch_remote_manifest(bucket, prefix, root_dir, "", allocator)
 
 		diff := diff_manifests(local_mf, remote_mf, allocator)
 		report.diff          = diff
@@ -460,11 +629,27 @@ run_assets :: proc(
 			for u in diff.untracked_remote do append(&to_up, u)
 		}
 
+		creds := resolve_s3_credentials(root_dir, context.temp_allocator)
+		user_arg := creds.ok ? fmt.tprintf("%s:%s", creds.access_key, creds.secret_key) : ""
+
 		for rel in to_up {
 			if !opts.dry_run {
 				src_file, _ := filepath.join({local_dir, rel}, context.temp_allocator)
 				r_key       := fmt.tprintf("%s/%s", prefix, rel)
-				_, stderr, up_ok := exec_t3({"objects", "put", bucket, r_key, src_file}, root_dir, allocator)
+				up_ok       := false
+				stderr      := ""
+				if creds.ok {
+					url := fmt.tprintf("%s/%s/%s", creds.endpoint, bucket, r_key)
+					st, _, serr, err := os.process_exec(
+						{command = {"curl", "-fsSL", "-X", "PUT", "--aws-sigv4", "aws:amz:auto:s3", "--user", user_arg, "--data-binary", fmt.tprintf("@%s", src_file), url}},
+						context.temp_allocator,
+					)
+					up_ok = err == nil && st.success
+					stderr = strings.trim_space(string(serr))
+				}
+				if !up_ok {
+					_, stderr, up_ok = exec_t3({"objects", "put", bucket, r_key, src_file}, root_dir, allocator)
+				}
 				if !up_ok {
 					report.status  = "failed"
 					report.message = fmt.aprintf("Failed to upload %s: %s", r_key, stderr, allocator = allocator)
@@ -477,8 +662,19 @@ run_assets :: proc(
 		if opts.delete_stale && rem_ok {
 			for rel in diff.missing_locally {
 				if !opts.dry_run {
-					rem_uri := fmt.tprintf("t3://%s/%s/%s", bucket, prefix, rel)
-					_, _, _ = exec_t3({"rm", "-y", rem_uri}, root_dir, allocator)
+					del_ok := false
+					if creds.ok {
+						url := fmt.tprintf("%s/%s/%s/%s", creds.endpoint, bucket, prefix, rel)
+						st, _, _, err := os.process_exec(
+							{command = {"curl", "-fsSL", "-X", "DELETE", "--aws-sigv4", "aws:amz:auto:s3", "--user", user_arg, url}},
+							context.temp_allocator,
+						)
+						del_ok = err == nil && st.success
+					}
+					if !del_ok {
+						rem_uri := fmt.tprintf("t3://%s/%s/%s", bucket, prefix, rel)
+						_, _, _ = exec_t3({"rm", "-y", rem_uri}, root_dir, allocator)
+					}
 				}
 				report.deleted_count += 1
 			}
@@ -494,7 +690,18 @@ run_assets :: proc(
 				defer _ = os.remove(tmp_mf_path)
 
 				mf_key := fmt.tprintf("%s/manifest.sha256", prefix)
-				_, _, _ = exec_t3({"objects", "put", bucket, mf_key, tmp_mf_path}, root_dir, allocator)
+				up_mf_ok := false
+				if creds.ok {
+					url := fmt.tprintf("%s/%s/%s", creds.endpoint, bucket, mf_key)
+					st, _, _, err := os.process_exec(
+						{command = {"curl", "-fsSL", "-X", "PUT", "--aws-sigv4", "aws:amz:auto:s3", "--user", user_arg, "--data-binary", fmt.tprintf("@%s", tmp_mf_path), url}},
+						context.temp_allocator,
+					)
+					up_mf_ok = err == nil && st.success
+				}
+				if !up_mf_ok {
+					_, _, _ = exec_t3({"objects", "put", bucket, mf_key, tmp_mf_path}, root_dir, allocator)
+				}
 			}
 		}
 
